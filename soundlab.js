@@ -71,7 +71,10 @@
     return Number(v.toFixed(decimals));
   }
   function formatValue(p, v) {
-    const num = p.type === "int" ? v : roundTo(v, p.step);
+    // `display` lets a parameter show something other than its raw value, for
+    // cases where the wire format is not what a player thinks in (master tuning
+    // travels in tenths of a Hz, so 4400 reads as 440.0)
+    const num = p.display ? p.display(v) : (p.type === "int" ? v : roundTo(v, p.step));
     const unit = p.unit ? `<span class="unit">${p.unit}</span>` : "";
     return `${num}${unit}`;
   }
@@ -91,15 +94,17 @@
       const input = document.createElement("input");
       input.type = "number";
       input.className = "save-field param-value-edit";
-      input.min = String(p.min); input.max = String(p.max);
-      input.step = String(p.step || "any");
-      input.value = String(getValue());
+      input.min = String(p.display ? p.display(p.min) : p.min);
+      input.max = String(p.display ? p.display(p.max) : p.max);
+      input.step = String(p.displayStep || p.step || "any");
+      input.value = String(p.display ? p.display(getValue()) : getValue());
       input.setAttribute("aria-label", p.name);
       let done = false;
       const finish = ok => {
         if (done) return;
         done = true;
-        const n = Number(input.value);
+        const n0 = Number(input.value);
+        const n = (isFinite(n0) && p.toRaw) ? p.toRaw(n0) : n0;
         if (ok && input.value !== "" && isFinite(n)) {
           let v = Math.min(p.max, Math.max(p.min, n));
           v = p.type === "int" ? Math.round(v) : roundTo(v, p.step);
@@ -195,9 +200,9 @@
   // no single-setting cards: transpose lives with Scale & harmony, the chord
   // voicing with Chord behaviour
   const PLAY_SETTING_CARDS = [
-    { title: "Scale & harmony", addrs: [30, 35, 34, 33, 31] },
-    { title: "Chord behaviour", addrs: [23, 21, 22, 120] },
-    { title: "Harp", addrs: [99, 40, 98] },
+    { title: "Scale & harmony", addrs: [30, 35, 34, 33, 31, 109] },
+    { title: "Chord behaviour", addrs: [23, 21, 22, 120, 37, 38, 39] },
+    { title: "Harp", addrs: [99, 40, 98, 36] },
   ];
 
   // second-level navigation inside Customize: groups belong to a voice/section domain
@@ -271,6 +276,7 @@
       portNoticeEl.append(pnText, pnBtn);
       middleRoot.appendChild(portNoticeEl);
       middleRoot.appendChild(deviceMap.el);
+      if (deviceMap.setHarpShape) deviceMap.setHarpShape(Prefs.get("harpShape"));
       updatePortNotice();
     }
     buildPlayExtras();   // Play tab: rhythm grid under the keyboard + note settings on the right
@@ -533,6 +539,7 @@
     drawActiveGraph();   // graph strokes read --accent at draw time
   }
   Prefs.subscribe("bankAccent", applyBankAccent);
+  Prefs.subscribe("harpShape", v => { if (deviceMap && deviceMap.setHarpShape) deviceMap.setHarpShape(v); });
   Prefs.subscribe("accentHue", applyBankAccent);
   // a knob can silently drive BPM/cycle/shuffle or a step (the dump then lies); note it, like the mirror does
   function updateRhythmPotNote() {
@@ -1864,7 +1871,7 @@
   function presetRealValue(p, vals) {
     const raw = vals[p.addr];
     if (raw == null) return null;
-    const v = p.type === "float" ? raw / FLOAT_MULT : raw;
+    const v = rawToReal(p, raw);
     return Math.min(p.max, Math.max(p.min, v));
   }
   // restore the given addresses to the loaded preset (UI + device); preset stays selected
@@ -2451,7 +2458,11 @@
   // Octave change (99/198) shifts audio pitch only, not the emitted MIDI notes, but
   // the labels show the SOUNDING pitch, so it relabels too (matching stays raw-MIDI).
   // 108 (single port) doesn't change note mapping but drives the mirror's warning chip
-  const DEVICEMAP_ADDRS = new Set([35, 30, 34, 33, 31, 98, 40, 120, 23, 108, 99, 198]);
+  // addresses the Play mirror draws from: editing one of these relabels the grid
+  // and the strings straight away. 36 is the harp scale mode, 39 the chord
+  // layout and 202-208 its slot assignments.
+  const DEVICEMAP_ADDRS = new Set([35, 30, 34, 33, 31, 98, 40, 120, 23, 108, 99, 198,
+    36, 37, 38, 39, 202, 203, 204, 205, 206, 207, 208]);
   function onPatchChange(p, value) {
     if (p) {   // undo/redo: every committed change records against the previous value
       const before = prevPatch[p.addr];
@@ -2888,6 +2899,9 @@
       { label: "Compact", value: "compact" },
       { label: "Verbose", value: "verbose" },
     ], "density"));
+    pop.appendChild(prefRow("Harp shape", "How the strings are drawn on the Play screen. Plate lays them out four by three, as they sit on the faceplate.", [
+      { label: "Strip", value: "strip" }, { label: "Plate", value: "plate" },
+    ], "harpShape"));
     pop.appendChild(prefRow("Term highlights", "Underline glossary words in descriptions (click to define).", [
       { label: "On", value: true }, { label: "Off", value: false },
     ], "glossary"));
@@ -4745,6 +4759,12 @@
 
   /* ---- Web MIDI device sync ------------------------------------------------ */
   const FLOAT_MULT = 100;
+  // a stored (raw) value in the units the Lab works in: floats are stored x100,
+  // and a param can reinterpret a raw value first (master tuning reads 0 as 4400)
+  function rawToReal(p, raw) {
+    const r = p.fromRaw ? p.fromRaw(raw) : raw;
+    return p.type === "float" ? r / FLOAT_MULT : r;
+  }
   const controller = (typeof MiniChordController !== "undefined") ? new MiniChordController() : null;
   const deviceCard = document.getElementById("device-card");
   const badge = document.getElementById("mode-badge");
@@ -4799,7 +4819,7 @@
     PARAM_GROUPS.forEach(g => g.params.forEach(p => {
       const raw = paramsByAddr[p.addr];
       if (raw == null || !controls[p.addr]) return;
-      let v = p.type === "float" ? raw / FLOAT_MULT : raw;
+      let v = rawToReal(p, raw);
       v = Math.min(p.max, Math.max(p.min, v));
       controls[p.addr].forEach(fn => fn(v));
       any = true;
@@ -4909,7 +4929,7 @@
     PARAM_GROUPS.forEach(g => g.params.forEach(p => {
       const raw = vals[p.addr];
       if (raw == null) return;
-      pp[p.addr] = p.type === "float" ? raw / FLOAT_MULT : raw;
+      pp[p.addr] = rawToReal(p, raw);
     }));
     return pp;
   }
@@ -5752,7 +5772,7 @@
     PARAM_GROUPS.forEach(g => g.params.forEach(p => {
       const rv = raw[p.addr];
       if (rv == null || !Number.isFinite(rv)) return;
-      const v = clampToParam(p, p.type === "float" ? rv / FLOAT_MULT : rv);
+      const v = clampToParam(p, rawToReal(p, rv));
       if (v != null) snap[p.addr] = v;
     }));
     return Object.keys(snap).length ? snap : null;
